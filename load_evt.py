@@ -7,14 +7,14 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
 class LoadDataset(Dataset):
-	def __init__(self, years=range(2010,2019), horizon=4,lookback=24,transform=None):
+	def __init__(self, years=range(2016,2019), horizon=5,lookback=60,transform=None):
 		"""
 		Args:
 			years (list): List of years for which the data is to be loaded
 		"""
 		# years = range(2010,2019)
 		# dfs = (pd.read_csv("http://pjm.com/pub/account/loadhryr/%s.txt"%str(yr)) for yr in years)
-		dfs = (pd.read_csv("/Users/vsokolov/prj/grid/data/load/%s.txt"%str(yr),usecols=[0,1,2],names=["date","hour","load"],header=0) for yr in years)
+		dfs = (pd.read_csv("../data/load/%s.txt"%str(yr),usecols=[0,1,2],names=["date","hour","load"],header=0) for yr in years)
 		load_df   = pd.concat(dfs, ignore_index=True)
 		load_df.date = pd.to_datetime(load_df.date, format='%m/%d/%y')
 		load_df.hour = pd.to_numeric(load_df.hour/100, downcast="integer")
@@ -36,9 +36,6 @@ class LoadDataset(Dataset):
 	def __getitem__(self,idx):
 		# pdb.set_trace()
 		current = self.data[idx+self.lookback+self.horizon-1,3]
-		# pdb.set_trace()
-		# print(self.data[idx:(idx+self.lookback),3].size())
-		# print(self.data[idx+self.lookback+self.horizon-1,0:3].size())
 		# past    = torch.cat([self.data[idx:(idx+self.lookback),3],self.data[idx+self.lookback+self.horizon-1,0:3]])
 		past    = torch.tensor(self.data[idx:(idx+self.lookback),3])
 		# print(past.size())
@@ -48,8 +45,6 @@ class LoadDataset(Dataset):
 		return sample	
 
 
-transformed_dataset = LoadDataset()
-dataloader = DataLoader(transformed_dataset, batch_size=32, num_workers=0)
 
 
 # for i_batch, sample_batched in enumerate(dataloader):
@@ -67,73 +62,91 @@ class EVT(nn.Module):
 		self.net = []
 		hs = [nin] + hidden_sizes + [nout]
 		for h0,h1 in zip(hs, hs[1:]):
-			self.net.extend([nn.Linear(h0, h1),nn.ReLU()])
+			self.net.extend([nn.Linear(h0, h1),nn.Tanh()])
 		self.net.pop() # pop the last nonlinear function for the output layer, just make it linear
 		self.net = nn.Sequential(*self.net)
-		# self.xi = torch.tensor([0.3], device=device, dtype=dtype, requires_grad=True)
+		self.net.apply(self.initweights)
+		self.xi = torch.tensor([1e-3], device=device, dtype=dtype, requires_grad=True)
+	def initweights(self,m):
+		if isinstance(m, nn.Linear):
+			nn.init.kaiming_uniform_(m.weight, mode='fan_out', nonlinearity='tanh')
 	def forward(self, x):
-		# pdb.set_trace()
 		y = self.net(x)
 		# return self.xi,y[:,0].exp()
 		# return self.xi,y[:,0].clamp(min=1e-6)
-		return y[:,0].clamp(1e-12)
+		return y[:,0].tanh().exp(), self.xi
+# for seed in range(20,60):
+seed = 39
+torch.manual_seed(seed)
+hidden = [3]
+learning_rate = 1e-2
+u = 31000
+nepoch =15
+nin = 36
 
 
-dtype = torch.float
+td = LoadDataset(lookback=nin)
+dataloader = DataLoader(td, batch_size=128, num_workers=0)
+
+dtype = torch.float32
 device = torch.device("cpu")
-nin = 24
 nout = 1
-hidden = [30]
 model = EVT(nin,hidden,nout)
-learning_rate = 1e-3
-optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate,weight_decay=1e-4)
 # optimizer = torch.optim.Adam(list(model.parameters()) + [model.xi],lr=learning_rate)
 loss_func = torch.nn.MSELoss() 
-# pdb.set_trace()
-# u = (35000 - transformed_dataset.min)/(transformed_dataset.max - transformed_dataset.min)
-u = (35500 - transformed_dataset.mean)/(transformed_dataset.std )
-# u = 35000
-print("u =",u)
-nepoch = 3
+# u = (u - td.min)/(td.max - td.min)
+u = ((u - td.mean)/(td.std)).item()
+nBtrain = int(len(td)/dataloader.batch_size*0.98)
 for epoch in range(nepoch):
 	for i, sample_batched in enumerate(dataloader):
 		# sample_batched = next(enumerate(dataloader))[1]
 		x,y = sample_batched["past"], sample_batched["current"]
-		g = model(x)
-		# tmp = (1+xi*(y-u)/s).clamp(min=1e-5)
-		# loss = (s.log() + (xi.pow(-1)+1)*(tmp).log()).mean()
-		
+		g,xi = model(x)
+
+		###### Model with nonzero xi ########
+		# tmp = (1+g.pow(-1)*xi*(y-u)).clamp(min=1e-8)
+		# ll = -g.log() - (xi.pow(-1)+1)*tmp.log()
+
+		###### Model with xi -> 0 ########
+		ll = -g.log() - g.pow(-1)*(y-u)
+
 		indicator = (y-u) > 0
-		indicator = indicator.type(dtype)
-		ll = g.log() - g*(y-u)
+		indicator = indicator.nonzero()
 		# pdb.set_trace()
-		loss = -(ll*indicator).mean()
+		# 
+		if indicator.shape[0]==0:
+			continue
+		loss = -(ll[indicator[:,0]]).mean() #only use samples with y > u
+		# loss = -(ll).mean() # use all samples
 		# loss = loss_func(g, y) 
 		if np.isnan(loss.item()):
 			pdb.set_trace()
-		# if (i%300==0):
-		# 	print(i, loss.item())
 		optimizer.zero_grad()
 		loss.backward()
 		optimizer.step()
-	print(epoch, loss.item())
+		if i==nBtrain:
+			break
+	print("Epoch %s: "%epoch, loss.item())
 
-
-# print(xi.item(),s.mean())
-# pdb.set_trace()
-# look at first few obsevations
-n = 300
+# print(xi.item())
+# test_ind = range(nBtrain*dataloader.batch_size, len(td))
+test_ind = range(len(td)-240, len(td))
+n = len(test_ind)
 y = np.zeros(n)
 yhat = np.zeros(n)
 for i in range(n):
-	yhat[i] = model(torch.tensor(transformed_dataset[i]["past"]).unsqueeze(0)).item()
-	y[i] = transformed_dataset[i]["current"].item()
+	yhat[i] = model(torch.tensor(td[test_ind[i]]["past"]).unsqueeze(0))[0].item()
+	y[i] = td[test_ind[i]]["current"].item()
 t = np.array(range(n))
-plt.plot(t, transformed_dataset.std.item()*y+transformed_dataset.mean.item(), 'k--', t, transformed_dataset.std.item()*np.exp(u.item()*(1/yhat))+transformed_dataset.mean.item(), 'r-')
-# plt.plot(t, transformed_dataset.std.item()*y+transformed_dataset.mean.item(), 'k--', t, transformed_dataset.std.item()*yhat+transformed_dataset.mean.item(), 'r-')
-plt.show()
+
+# plt.plot(t, td.std.item()*y.astype(np.float32)+td.mean.item(), 'k--', t, td.std.item()*(u+yhat.astype(np.float32)/(1-xi.item()))+td.mean.item(), 'r-')
+plt.figure()
+plt.plot(t, td.std.item()*y.astype(np.float32)+td.mean.item(), 'k--', t, td.std.item()*(u+yhat.astype(np.float32))+td.mean.item(), 'r-')
+plt.savefig(str(seed)+"_evt.png")
 
 
-# model(torch.tensor(transformed_dataset[10]["past"]).unsqueeze(0))
-# model(torch.tensor(transformed_dataset[40]["past"]).unsqueeze(0))
+# model(torch.tensor(td[10]["past"]).unsqueeze(0))
+# model(torch.tensor(td[40]["past"]).unsqueeze(0))
+
 
